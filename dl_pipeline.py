@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import StratifiedKFold
+import random
 
 
 
@@ -197,6 +198,12 @@ class DLTrainer:
         else:
             return nn.MSELoss()
 
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0.0)
+
     def fit(
         self,
         X_train_num: np.ndarray,
@@ -210,7 +217,6 @@ class DLTrainer:
 
         seed_everything(seed)
 
-        # Подготовка данных
         train_dataset = TabularDataset(X_train_num, X_train_cat, y_train)
         train_loader = DataLoader(
             train_dataset, batch_size=self.config.batch_size, shuffle=True
@@ -223,9 +229,9 @@ class DLTrainer:
                 val_dataset, batch_size=self.config.batch_size, shuffle=False
             )
 
-        # Инициализация модели
         in_features = X_train_num.shape[1]
         self.model = FlexibleMLP(in_features, self.config).to(self.device)
+        self.model.apply(self._init_weights)
 
         opt_cls = OPTIMIZER_MAP.get(
             self.config.optimizer_name.lower(), torch.optim.AdamW
@@ -249,35 +255,33 @@ class DLTrainer:
 
         history = {'train_loss': [], 'val_loss': []}
 
-        # --- Переменные для Early Stopping ---
         best_val_loss = float('inf')
         best_model_weights = None
         patience_counter = 0
 
         for epoch in range(1, self.config.epochs + 1):
-            # --- Training ---
+            # --- Train ---
             self.model.train()
             running_loss = 0.0
             for batch in train_loader:
                 x_num = batch['num'].to(self.device)
-                x_cat = (
-                    batch['cat'].to(self.device) if 'cat' in batch else None
-                )
+                x_cat = batch['cat'].to(self.device) if 'cat' in batch else None
                 y = batch['y'].to(self.device)
 
-                if self.config.task == 'binary':
+                if self.config.task in ['binary', 'regression']:
                     y = y.unsqueeze(1)
                 elif self.config.task == 'multiclass':
                     y = y.long()
-                else:
-                    y = y.unsqueeze(1)
 
                 optimizer.zero_grad()
                 preds = self.model(x_num, x_cat)
                 loss = self.criterion(preds, y)
                 loss.backward()
+                
+                # Grad Clipping для защиты от взрыва градиентов
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                
                 optimizer.step()
-
                 running_loss += loss.item() * x_num.size(0)
 
             if scheduler is not None:
@@ -286,27 +290,20 @@ class DLTrainer:
             epoch_train_loss = running_loss / len(train_dataset)
             history['train_loss'].append(epoch_train_loss)
 
-            # --- Validation ---
-            epoch_val_loss = None
+            # --- Validation & Early Stopping ---
             if val_loader is not None:
                 self.model.eval()
                 val_running_loss = 0.0
                 with torch.no_grad():
                     for batch in val_loader:
                         x_num = batch['num'].to(self.device)
-                        x_cat = (
-                            batch['cat'].to(self.device)
-                            if 'cat' in batch
-                            else None
-                        )
+                        x_cat = batch['cat'].to(self.device) if 'cat' in batch else None
                         y = batch['y'].to(self.device)
 
-                        if self.config.task == 'binary':
+                        if self.config.task in ['binary', 'regression']:
                             y = y.unsqueeze(1)
                         elif self.config.task == 'multiclass':
                             y = y.long()
-                        else:
-                            y = y.unsqueeze(1)
 
                         preds = self.model(x_num, x_cat)
                         loss = self.criterion(preds, y)
@@ -315,7 +312,6 @@ class DLTrainer:
                 epoch_val_loss = val_running_loss / len(val_loader.dataset)
                 history['val_loss'].append(epoch_val_loss)
 
-                # --- Логика Early Stopping ---
                 if self.config.early_stopping:
                     if epoch_val_loss < best_val_loss:
                         best_val_loss = epoch_val_loss
@@ -324,17 +320,9 @@ class DLTrainer:
                     else:
                         patience_counter += 1
                         if patience_counter >= self.config.patience:
-                            # Восстанавливаем лучшие веса
-                            if best_model_weights is not None:
-                                self.model.load_state_dict(best_model_weights)
                             break
 
-        # Если Early Stopping не сработал раньше, загружаем лучшую модель под конец
-        if (
-            self.config.early_stopping
-            and val_loader is not None
-            and best_model_weights is not None
-        ):
+        if self.config.early_stopping and best_model_weights is not None:
             self.model.load_state_dict(best_model_weights)
 
         return history
@@ -352,9 +340,7 @@ class DLTrainer:
         with torch.no_grad():
             for batch in loader:
                 x_num = batch['num'].to(self.device)
-                x_cat = (
-                    batch['cat'].to(self.device) if 'cat' in batch else None
-                )
+                x_cat = batch['cat'].to(self.device) if 'cat' in batch else None
                 out = self.model(x_num, x_cat)
 
                 if self.config.task == 'binary':
