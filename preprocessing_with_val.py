@@ -18,260 +18,489 @@ from catboost import CatBoostClassifier
 from lightgbm import LGBMClassifier
 from xgboost import XGBClassifier
 
-def evaluate_pipeline_with_cv(
-    train_df, processing_func, pipeline_name='Pipeline'
+# machine learning
+from sklearn.base import clone
+
+from sklearn.pipeline import Pipeline
+
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+
+from category_encoders import TargetEncoder
+from sklearn.preprocessing import StandardScaler, OneHotEncoder, LabelEncoder, QuantileTransformer, OrdinalEncoder 
+
+from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold, GridSearchCV, KFold, RepeatedKFold, RandomizedSearchCV
+
+from sklearn.linear_model import LogisticRegression, Perceptron, SGDClassifier, LinearRegression, Ridge, Lasso, ElasticNet, SGDRegressor
+from sklearn.svm import SVC, SVR, LinearSVC
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
+from sklearn.naive_bayes import GaussianNB
+from sklearn.tree import DecisionTreeClassifier
+
+from lightgbm import LGBMClassifier, LGBMRegressor
+from xgboost import XGBClassifier, XGBRegressor
+from catboost import CatBoostRegressor, CatBoostClassifier, Pool
+
+from pathlib import Path
+from scipy.stats import skew
+
+from sklearn.metrics import (
+    log_loss,
+    precision_score,
+    recall_score,
+    accuracy_score,
+    classification_report,
+    f1_score,
+    roc_auc_score,
+
+    average_precision_score,
+    mean_absolute_error,
+    mean_absolute_percentage_error,
+    r2_score,
+    mean_squared_error, 
+    root_mean_squared_error
+)
+
+
+
+
+def process_v1(train, test, target_col="SalePrice"):
+    y_train_full = train[target_col].copy()
+    train_features = train.drop(columns=[target_col])
+    n_train = train_features.shape[0]
+
+    combined = pd.concat([train_features, test], axis=0, ignore_index=True)
+
+    # 1. Заполнение спецификаций и исправлений
+    if "Functional" in combined.columns:
+        combined["Functional"] = combined["Functional"].fillna("Typ")
+
+    if "Exterior2nd" in combined.columns:
+        corrections = {
+            "Wd Shng": "Wd Sdng",
+            "CmentBd": "CemntBd",
+            "Brk Cmn": "BrkComm",
+        }
+        combined["Exterior2nd"] = combined["Exterior2nd"].replace(corrections)
+
+    if "LotFrontage" in combined.columns and "Neighborhood" in combined.columns:
+        combined["LotFrontage"] = combined.groupby("Neighborhood")[
+            "LotFrontage"
+        ].transform(lambda s: s.fillna(s.median()))
+
+    # 2. Маппинг качественных признаков
+    qual_map = {"Ex": 5, "Gd": 4, "TA": 3, "Fa": 2, "Po": 1, "NA": 0}
+    quality_cols = [
+        "PoolQC",
+        "GarageQual",
+        "GarageCond",
+        "BsmtQual",
+        "BsmtCond",
+        "ExterQual",
+        "ExterCond",
+        "KitchenQual",
+        "HeatingQC",
+        "FireplaceQu",
+    ]
+    for col in quality_cols:
+        if col in combined.columns:
+            combined[col] = combined[col].map(qual_map).fillna(0).astype(int)
+
+    # 3. Генерация новых признаков
+    if {"TotalBsmtSF", "1stFlrSF", "2ndFlrSF"}.issubset(combined.columns):
+        combined["TotalSF"] = (
+            combined["TotalBsmtSF"].fillna(0)
+            + combined["1stFlrSF"]
+            + combined["2ndFlrSF"]
+        )
+
+    if {"YrSold", "YearBuilt"}.issubset(combined.columns):
+        combined["HouseAge"] = combined["YrSold"] - combined["YearBuilt"]
+
+    bath_cols = {"FullBath", "HalfBath", "BsmtFullBath", "BsmtHalfBath"}
+    if bath_cols.issubset(combined.columns):
+        combined["TotalBath"] = (
+            combined["FullBath"].fillna(0)
+            + 0.5 * combined["HalfBath"].fillna(0)
+            + combined["BsmtFullBath"].fillna(0)
+            + 0.5 * combined["BsmtHalfBath"].fillna(0)
+        )
+
+    if {"OverallQual", "GrLivArea"}.issubset(combined.columns):
+        combined["QualityLivArea"] = (
+            combined["OverallQual"] * combined["GrLivArea"]
+        )
+
+    if {"YrSold", "YearRemodAdd"}.issubset(combined.columns):
+        combined["YearsSinceRemodel"] = (
+            combined["YrSold"] - combined["YearRemodAdd"]
+        )
+
+    has_flag_specs = {
+        "HasPool": "PoolArea",
+        "Has2ndFloor": "2ndFlrSF",
+        "HasBsmt": "TotalBsmtSF",
+        "HasFireplace": "Fireplaces",
+        "HasGarage": "GarageArea",
+    }
+    for flag_name, source_col in has_flag_specs.items():
+        if source_col in combined.columns:
+            combined[flag_name] = (
+                combined[source_col].fillna(0) > 0
+            ).astype(int)
+
+    # 4. Выделение Neighborhood под безопасный Target Encoding
+    HAS_NEIGHBORHOOD = "Neighborhood" in combined.columns
+    if HAS_NEIGHBORHOOD:
+        neighborhood_all = (
+            combined["Neighborhood"].fillna("Unknown").reset_index(drop=True)
+        )
+        combined = combined.drop(columns=["Neighborhood"])
+
+    # 5. Группировка редких категорий
+    RARE_THRESHOLD = 0.01
+    categorical_cols = combined.select_dtypes(
+        include="object"
+    ).columns.tolist()
+    for col in categorical_cols:
+        freq = combined[col].value_counts(normalize=True, dropna=True)
+        rare_categories = freq[freq < RARE_THRESHOLD].index
+        if len(rare_categories) > 0:
+            combined[col] = combined[col].where(
+                ~combined[col].isin(rare_categories), "Other"
+            )
+
+    # 6. Обработка пропусков
+    numeric_cols = combined.select_dtypes(include=[np.number]).columns
+    categorical_cols = combined.select_dtypes(include=["object"]).columns
+
+    for col in numeric_cols:
+        if combined[col].isnull().any():
+            combined[col] = combined[col].fillna(combined[col].median())
+
+    for col in categorical_cols:
+        if combined[col].isnull().any():
+            combined[col] = combined[col].fillna("None")
+
+    # 7. Логарифмирование скошенных признаков
+    SKEW_THRESHOLD = 0.75
+    exclude_from_skew = (
+        {"Id"} | set(has_flag_specs.keys()) | set(quality_cols)
+    )
+
+    numeric_cols = [
+        c
+        for c in combined.select_dtypes(include=[np.number]).columns
+        if c not in exclude_from_skew
+    ]
+    skewed = combined[numeric_cols].apply(lambda s: skew(s.dropna()))
+    skewed_cols = skewed[skewed.abs() > SKEW_THRESHOLD].index.tolist()
+
+    for col in skewed_cols:
+        combined[col] = np.log1p(combined[col].clip(lower=0))
+
+    # 8. OHE и разделение обратно на train / val
+    cat_cols = combined.select_dtypes(include="object").columns.tolist()
+    combined = pd.get_dummies(combined, columns=cat_cols, dummy_na=False)
+
+    drop_cols = ["Id"] if "Id" in combined.columns else []
+    X_train = (
+        combined.iloc[:n_train, :].drop(columns=drop_cols).reset_index(drop=True)
+    )
+    X_test = (
+        combined.iloc[n_train:, :].drop(columns=drop_cols).reset_index(drop=True)
+    )
+    X_train, X_test = X_train.align(X_test, join="left", axis=1, fill_value=0)
+
+    # 9. Применение Target Encoding для Neighborhood внутри фолда
+    if HAS_NEIGHBORHOOD:
+        neigh_tr = neighborhood_all.iloc[:n_train].reset_index(drop=True)
+        neigh_val = neighborhood_all.iloc[n_train:].reset_index(drop=True)
+
+        target_map = y_train_full.groupby(neigh_tr).mean()
+        global_mean = y_train_full.mean()
+
+        X_train["Neighborhood_TE"] = neigh_tr.map(target_map).fillna(global_mean)
+        X_test["Neighborhood_TE"] = neigh_val.map(target_map).fillna(global_mean)
+
+    # 10. Логарифмирование целевой переменной (приведение к единому масштабу)
+    Y_train_log = np.log1p(y_train_full).reset_index(drop=True)
+
+    return X_train, Y_train_log, X_test
+
+def process_v2(train, test, target_col="SalePrice"):
+    y_train_full = train[target_col].copy()
+    train_features = train.drop(columns=[target_col])
+    n_train = train_features.shape[0]
+
+    combined = pd.concat([train_features, test], axis=0, ignore_index=True)
+
+    # 1. Заполнение спецификаций и исправлений
+    if "Functional" in combined.columns:
+        combined["Functional"] = combined["Functional"].fillna("Typ")
+
+    if "Exterior2nd" in combined.columns:
+        corrections = {
+            "Wd Shng": "Wd Sdng",
+            "CmentBd": "CemntBd",
+            "Brk Cmn": "BrkComm",
+        }
+        combined["Exterior2nd"] = combined["Exterior2nd"].replace(corrections)
+
+    if "LotFrontage" in combined.columns and "Neighborhood" in combined.columns:
+        combined["LotFrontage"] = combined.groupby("Neighborhood")[
+            "LotFrontage"
+        ].transform(lambda s: s.fillna(s.median()))
+
+    # 2. Маппинг качественных признаков
+    qual_map = {"Ex": 5, "Gd": 4, "TA": 3, "Fa": 2, "Po": 1, "NA": 0}
+    quality_cols = [
+        "PoolQC",
+        "GarageQual",
+        "GarageCond",
+        "BsmtQual",
+        "BsmtCond",
+        "ExterQual",
+        "ExterCond",
+        "KitchenQual",
+        "HeatingQC",
+        "FireplaceQu",
+    ]
+    for col in quality_cols:
+        if col in combined.columns:
+            combined[col] = combined[col].map(qual_map).fillna(0).astype(int)
+
+    # 3. Генерация новых признаков
+    if {"TotalBsmtSF", "1stFlrSF", "2ndFlrSF"}.issubset(combined.columns):
+        combined["TotalSF"] = (
+            combined["TotalBsmtSF"].fillna(0)
+            + combined["1stFlrSF"]
+            + combined["2ndFlrSF"]
+        )
+
+    if {"YrSold", "YearBuilt"}.issubset(combined.columns):
+        combined["HouseAge"] = combined["YrSold"] - combined["YearBuilt"]
+
+    bath_cols = {"FullBath", "HalfBath", "BsmtFullBath", "BsmtHalfBath"}
+    if bath_cols.issubset(combined.columns):
+        combined["TotalBath"] = (
+            combined["FullBath"].fillna(0)
+            + 0.5 * combined["HalfBath"].fillna(0)
+            + combined["BsmtFullBath"].fillna(0)
+            + 0.5 * combined["BsmtHalfBath"].fillna(0)
+        )
+
+    if {"OverallQual", "GrLivArea"}.issubset(combined.columns):
+        combined["QualityLivArea"] = (
+            combined["OverallQual"] * combined["GrLivArea"]
+        )
+
+    if {"YrSold", "YearRemodAdd"}.issubset(combined.columns):
+        combined["YearsSinceRemodel"] = (
+            combined["YrSold"] - combined["YearRemodAdd"]
+        )
+
+    has_flag_specs = {
+        "HasPool": "PoolArea",
+        "Has2ndFloor": "2ndFlrSF",
+        "HasBsmt": "TotalBsmtSF",
+        "HasFireplace": "Fireplaces",
+        "HasGarage": "GarageArea",
+    }
+    for flag_name, source_col in has_flag_specs.items():
+        if source_col in combined.columns:
+            combined[flag_name] = (
+                combined[source_col].fillna(0) > 0
+            ).astype(int)
+
+    # 4. Выделение Neighborhood под безопасный Target Encoding
+    HAS_NEIGHBORHOOD = "Neighborhood" in combined.columns
+    if HAS_NEIGHBORHOOD:
+        neighborhood_all = (
+            combined["Neighborhood"].fillna("Unknown").reset_index(drop=True)
+        )
+        combined = combined.drop(columns=["Neighborhood"])
+
+    # 5. Группировка редких категорий
+    RARE_THRESHOLD = 0.01
+    categorical_cols = combined.select_dtypes(
+        include="object"
+    ).columns.tolist()
+    for col in categorical_cols:
+        freq = combined[col].value_counts(normalize=True, dropna=True)
+        rare_categories = freq[freq < RARE_THRESHOLD].index
+        if len(rare_categories) > 0:
+            combined[col] = combined[col].where(
+                ~combined[col].isin(rare_categories), "Other"
+            )
+
+    # 6. Обработка пропусков
+    numeric_cols = combined.select_dtypes(include=[np.number]).columns
+    categorical_cols = combined.select_dtypes(include=["object"]).columns
+
+    for col in numeric_cols:
+        if combined[col].isnull().any():
+            combined[col] = combined[col].fillna(combined[col].median())
+
+    for col in categorical_cols:
+        if combined[col].isnull().any():
+            combined[col] = combined[col].fillna("None")
+
+    # 7. Логарифмирование скошенных признаков
+    SKEW_THRESHOLD = 0.75
+    exclude_from_skew = (
+        {"Id"} | set(has_flag_specs.keys()) | set(quality_cols)
+    )
+
+    numeric_cols = [
+        c
+        for c in combined.select_dtypes(include=[np.number]).columns
+        if c not in exclude_from_skew
+    ]
+    skewed = combined[numeric_cols].apply(lambda s: skew(s.dropna()))
+    skewed_cols = skewed[skewed.abs() > SKEW_THRESHOLD].index.tolist()
+
+    for col in skewed_cols:
+        combined[col] = np.log1p(combined[col].clip(lower=0))
+
+    # 8. OHE и разделение обратно на train / val
+    cat_cols = combined.select_dtypes(include="object").columns.tolist()
+    combined = pd.get_dummies(combined, columns=cat_cols, dummy_na=False)
+
+    # Заменяем boolean-столбцы от get_dummies на float32
+    bool_cols = combined.select_dtypes(include="bool").columns
+    combined[bool_cols] = combined[bool_cols].astype(np.float32)
+
+    drop_cols = ["Id"] if "Id" in combined.columns else []
+    X_train = (
+        combined.iloc[:n_train, :].drop(columns=drop_cols).reset_index(drop=True)
+    )
+    X_test = (
+        combined.iloc[n_train:, :].drop(columns=drop_cols).reset_index(drop=True)
+    )
+    X_train, X_test = X_train.align(X_test, join="left", axis=1, fill_value=0)
+
+    # 9. Применение Target Encoding для Neighborhood внутри фолда
+    if HAS_NEIGHBORHOOD:
+        neigh_tr = neighborhood_all.iloc[:n_train].reset_index(drop=True)
+        neigh_val = neighborhood_all.iloc[n_train:].reset_index(drop=True)
+
+        # Обучаем Target Encoding на log(y_train_full)
+        y_log_train = np.log1p(y_train_full)
+        target_map = y_log_train.groupby(neigh_tr).mean()
+        global_mean = y_log_train.mean()
+
+        X_train["Neighborhood_TE"] = neigh_tr.map(target_map).fillna(global_mean)
+        X_test["Neighborhood_TE"] = neigh_val.map(target_map).fillna(global_mean)
+
+    # 10. ВАЖНО ДЛЯ НЕЙРОСЕТЕЙ: Стандартизация всех признаков X
+    scaler = StandardScaler()
+    X_train_scaled = pd.DataFrame(
+        scaler.fit_transform(X_train),
+        columns=X_train.columns,
+        dtype=np.float32,
+    )
+    X_test_scaled = pd.DataFrame(
+        scaler.transform(X_test),
+        columns=X_test.columns,
+        dtype=np.float32,
+    )
+
+    # 11. Логарифмирование целевой переменной
+    Y_train_log = np.log1p(y_train_full).reset_index(drop=True)
+
+    return X_train_scaled, Y_train_log, X_test_scaled
+
+def evaluate_pipeline_with_cv_regression(
+    train_df, processing_func, target_col="SalePrice", pipeline_name="Pipeline"
 ):
     models_dict = {
-        'Logistic Regression': LogisticRegression(
-            random_state=42, max_iter=1000
-        ),
-        'Logistic Regression (L2)': LogisticRegression(
-            penalty='l2', solver='saga', random_state=42, max_iter=2000
-        ),
-        'Logistic Regression (L1)': LogisticRegression(
-            penalty='l1', solver='saga', random_state=42, max_iter=2000
-        ),
-        'Logistic Regression (ElasticNet)': LogisticRegression(
-            penalty='elasticnet',
-            solver='saga',
-            l1_ratio=0.5,
-            random_state=42,
-            max_iter=2000,
-        ),
-        'Support Vector Machines': SVC(random_state=42, probability=True),
-        'KNN': KNeighborsClassifier(n_neighbors=3),
-        'Naive Bayes': GaussianNB(),
-        'Perceptron': Perceptron(random_state=42),
-        'Linear SVC': LinearSVC(random_state=42, max_iter=2000),
-        'Stochastic Gradient Decent': SGDClassifier(random_state=42),
-        'Random Forest': RandomForestClassifier(
+        "Linear Regression": LinearRegression(),
+        "Ridge (L2)": Ridge(random_state=42),
+        "Lasso (L1)": Lasso(random_state=42),
+        "ElasticNet": ElasticNet(random_state=42),
+        "Support Vector Regression": SVR(),
+        "KNN Regressor": KNeighborsRegressor(n_neighbors=5),
+        "Stochastic Gradient Descent": SGDRegressor(random_state=42),
+        "Random Forest": RandomForestRegressor(
             random_state=42, n_estimators=100
         ),
         # --- Градиентный бустинг ---
-        'CatBoost': CatBoostClassifier(verbose=0, random_state=42),
-        'XGBoost': XGBClassifier(
-            random_state=42, eval_metric='logloss', use_label_encoder=False
-        ),
-        'LightGBM': LGBMClassifier(random_state=42, verbose=-1),
+        "CatBoost": CatBoostRegressor(verbose=0, random_state=42),
+        "XGBoost": XGBRegressor(random_state=42),
+        "LightGBM": LGBMRegressor(random_state=42, verbose=-1),
     }
 
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
     results = []
 
     for name, model in models_dict.items():
-        cv_scores = []
+        rmse_scores = []
 
         # Разбиваем train_df на 5 фолдов
-        for train_idx, val_idx in skf.split(train_df, train_df['Survived']):
+        for train_idx, val_idx in kf.split(train_df):
             fold_train = train_df.iloc[train_idx]
             fold_val = train_df.iloc[val_idx]
 
-            # Изолированная обработка данных ВНУТРИ фолда!
-            X_tr, Y_tr, X_val = processing_func(fold_train, fold_val)
+            # Изолированная обработка данных ВНУТРИ фолда
+            X_tr, Y_tr, X_val = processing_func(
+                fold_train, fold_val, target_col
+            )
+
+            # Приводим целевую переменную валидации к логарифмическому масштабу (как и Y_tr)
+            Y_val = np.log1p(fold_val[target_col])
 
             model.fit(X_tr, Y_tr)
 
-            # Оценка качества на валидационном фолде
-            val_score = round(model.score(X_val, fold_val['Survived']) * 100, 2)
-            cv_scores.append(val_score)
+            # Предсказание и расчёт RMSE (через np.sqrt для совместимости со свежим scikit-learn)
+            preds = model.predict(X_val)
+            rmse = np.sqrt(mean_squared_error(Y_val, preds))
+            rmse_scores.append(rmse)
 
-        # Среднее значение точности по 5 фолдам
+        # Среднее значение RMSE (RMSLE) по 5 фолдам
         results.append(
             {
-                'Model': name,
-                f'{pipeline_name}_CV_Acc': round(np.mean(cv_scores), 2),
+                "Model": name,
+                f"{pipeline_name}_CV_RMSE": round(np.mean(rmse_scores), 4),
+                f"{pipeline_name}_Std": round(np.std(rmse_scores), 4),
             }
         )
 
+    # Для RMSE чем меньше значение, тем лучше (ascending=True)
     return (
         pd.DataFrame(results)
-        .sort_values(by=f'{pipeline_name}_CV_Acc', ascending=False)
+        .sort_values(by=f"{pipeline_name}_CV_RMSE", ascending=True)
         .reset_index(drop=True)
     )
 
 
 
 
-def process_v1(train_df, test_df):
-    features = ['Pclass', 'Sex', 'Age', 'SibSp', 'Parch', 'Embarked']
-    X_tr, X_te = train_df[features].copy(), test_df[features].copy()
-
-    age_median = X_tr['Age'].median()
-    X_tr['Age'] = X_tr['Age'].fillna(age_median)
-    X_te['Age'] = X_te['Age'].fillna(age_median)
-
-    bins = [-1, 0, 2, np.inf]
-    labels = ['Alone', 'Few_persons', 'Family']
-    X_tr['SibSp_new'] = pd.cut(
-        X_tr['SibSp'], bins=bins, labels=labels, include_lowest=True
-    )
-    X_te['SibSp_new'] = pd.cut(
-        X_te['SibSp'], bins=bins, labels=labels, include_lowest=True
-    )
-
-    sex_map = {'female': 1, 'male': 0}
-    pclass_map = {1: 'Upper', 2: 'Middle', 3: 'Lower'}
-    embarked_map = {'C': 'Cherbourg', 'Q': 'Queenstown', 'S': 'Southampton'}
-
-    for df in [X_tr, X_te]:
-        df['Sex'] = df['Sex'].map(sex_map)
-        df['Pclass'] = df['Pclass'].map(pclass_map)
-        df['Embarked'] = df['Embarked'].map(embarked_map)
-
-    cols_to_use = ['Pclass', 'Sex', 'SibSp_new', 'Parch', 'Embarked', 'Age']
-    X_tr_encoded = pd.get_dummies(X_tr[cols_to_use], drop_first=True)
-    X_te_encoded = pd.get_dummies(X_te[cols_to_use], drop_first=True)
-
-    X_tr_encoded, X_te_encoded = X_tr_encoded.align(
-        X_te_encoded, join='left', axis=1, fill_value=0
-    )
-
-    for df in [X_tr_encoded, X_te_encoded]:
-        bool_cols = df.select_dtypes(include='bool').columns
-        df[bool_cols] = df[bool_cols].astype(int)
-
-    return X_tr_encoded, train_df['Survived'], X_te_encoded
 
 
-def process_v2(train_df, test_df):
-    age_median = train_df['Age'].median()
-    train_data = train_df[
-        ['Survived', 'Pclass', 'Sex', 'Age', 'SibSp', 'Parch', 'Embarked']
-    ].copy()
-    test_data = test_df[
-        ['Pclass', 'Sex', 'Age', 'SibSp', 'Parch', 'Embarked']
-    ].copy()
-
-    for df in [train_data, test_data]:
-        df['Age'] = df['Age'].fillna(age_median).astype(int)
-        df['Sex'] = df['Sex'].map({'female': 1, 'male': 0})
-        df['Embarked'] = df['Embarked'].map(
-            {'C': 'Cherbourg', 'Q': 'Queenstown', 'S': 'Southampton'}
-        )
-        df['FamilySize'] = df['SibSp'] + df['Parch'] + 1
-        df['IsAlone'] = (df['FamilySize'] == 1).astype(int)
-        df['Age'] = pd.cut(
-            df['Age'],
-            bins=[-float('inf'), 16, 32, 48, 64, float('inf')],
-            labels=[0, 1, 2, 3, 4],
-        ).astype(int)
-
-    encoder = TargetEncoder(cols=['Embarked'])
-    train_data['Embarked_encoded'] = encoder.fit_transform(
-        train_data['Embarked'], train_data['Survived']
-    ).round(2)
-    test_data['Embarked_encoded'] = encoder.transform(
-        test_data['Embarked']
-    ).round(2)
-
-    for df in [train_data, test_data]:
-        df['Age*Pclass'] = df['Age'] * df['Pclass']
-        df.drop(columns=['Embarked'], inplace=True)
-
-    X_train = train_data.drop(columns=['Survived', 'Parch', 'Age'])
-    Y_train = train_data['Survived']
-    X_test = test_data.drop(columns=['Parch', 'Age'])
-
-    return X_train, Y_train, X_test
 
 
-def process_v3(train_df, test_df):
-    age_median = train_df['Age'].median()
-    raw_cols = ['Pclass', 'Sex', 'Age', 'SibSp', 'Parch', 'Embarked']
-
-    X_tr, X_te = train_df[raw_cols].copy(), test_df[raw_cols].copy()
-    X_tr['Age'] = X_tr['Age'].fillna(age_median).astype(int)
-    X_te['Age'] = X_te['Age'].fillna(age_median).astype(int)
-
-    sex_map = {'female': 1, 'male': 0}
-    pclass_map = {1: 'Upper', 2: 'Middle', 3: 'Lower'}
-    embarked_map = {'C': 'Cherbourg', 'Q': 'Queenstown', 'S': 'Southampton'}
-    bins = [0, 12, 18, 35, 60, 100]
-
-    for df in [X_tr, X_te]:
-        df['Sex'] = df['Sex'].map(sex_map)
-        df['Pclass'] = df['Pclass'].map(pclass_map)
-        df['Embarked'] = df['Embarked'].map(embarked_map)
-        df['FamilySize'] = df['SibSp'] + df['Parch'] + 1
-        df['IsAlone'] = (df['FamilySize'] == 1).astype(int)
-        df['AgeGroup'] = pd.cut(
-            df['Age'], bins=bins, labels=False, right=False
-        )
-
-    features = [
-        'Pclass',
-        'Sex',
-        'Parch',
-        'Embarked',
-        'FamilySize',
-        'IsAlone',
-        'AgeGroup',
-    ]
-    X_tr_encoded = pd.get_dummies(X_tr[features], dtype=int, drop_first=True)
-    X_te_encoded = pd.get_dummies(X_te[features], dtype=int, drop_first=True)
-    X_tr_encoded, X_te_encoded = X_tr_encoded.align(
-        X_te_encoded, join='left', axis=1, fill_value=0
-    )
-
-    scaler = StandardScaler()
-    X_tr_encoded['Age_scaled'] = scaler.fit_transform(X_tr[['Age']])
-    X_te_encoded['Age_scaled'] = scaler.transform(X_te[['Age']])
-
-    return X_tr_encoded, train_df['Survived'], X_te_encoded
 
 
-def process_v4(train_df, test_df):
-    df_train, df_test = train_df.copy(), test_df.copy()
-
-    fare_median = df_train['Fare'].median()
-    df_train['Fare'] = df_train['Fare'].fillna(fare_median)
-    df_test['Fare'] = df_test['Fare'].fillna(fare_median)
-
-    age_medians = df_train.groupby(['Sex', 'Pclass'])['Age'].median()
-
-    def fill_age(df):
-        return df.apply(
-            lambda row: age_medians.get(
-                (row['Sex'], row['Pclass']), df_train['Age'].median()
-            )
-            if pd.isna(row['Age'])
-            else row['Age'],
-            axis=1,
-        ).astype(int)
-
-    df_train['Age'] = fill_age(df_train)
-    df_test['Age'] = fill_age(df_test)
-
-    sex_map = {'male': 0, 'female': 1}
-    embarked_map = {'S': 0, 'C': 1, 'Q': 2}
-
-    for df in [df_train, df_test]:
-        df['Sex'] = df['Sex'].map(sex_map)
-        df['Embarked'] = df['Embarked'].fillna('S').map(embarked_map)
-        df['FamilySize'] = df['SibSp'] + df['Parch'] + 1
-        df['IsAlone'] = (df['FamilySize'] == 1).astype(int)
-
-    feature_cols = [
-        'Pclass',
-        'Sex',
-        'Age',
-        'SibSp',
-        'Parch',
-        'Fare',
-        'Embarked',
-        'FamilySize',
-        'IsAlone',
-    ]
-    return (
-        df_train[feature_cols],
-        df_train['Survived'],
-        df_test[feature_cols],
-    )
 
 
-# ==========================================
-# 2. УНИВЕРСАЛЬНАЯ ОЦЕНКА МОДЕЛЕЙ (5-FOLD CV)
-# ==========================================
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
